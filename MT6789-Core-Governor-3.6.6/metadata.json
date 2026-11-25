@@ -1,0 +1,6 @@
+{
+  "name": "CoreGovernor",
+  "description": "Root CPU and GPU governor for MediaTek devices with per-mode frequency grading, thermal curves, and power-draw throttling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
