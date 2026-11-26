@@ -239,6 +239,37 @@ data class StutterHunterConfig(
     val whitelist: Set<String> = emptySet()
 )
 
+data class ThreadAffinityMapping(
+    val pattern: String,
+    val cpuMask: String,
+    val exactMatch: Boolean = false,
+    val packageName: String = ""
+)
+
+data class ThreadObservationEntry(
+    val threadName: String,
+    val lastKnownTid: Int = 0,
+    val lastObservedAtMs: Long = 0L,
+    val observationCount: Int = 1
+)
+
+data class GameThreadHistoryRecord(
+    val packageName: String,
+    val displayName: String = "",
+    val lastProcessName: String = "",
+    val lastObservedAtMs: Long = 0L,
+    val threads: List<ThreadObservationEntry> = emptyList()
+)
+
+data class GameThreadControllerConfig(
+    val enabled: Boolean = false,
+    val autoClassify: Boolean = false,
+    val selectedGamePackage: String = "",
+    val lastObservedGamePackage: String = "",
+    val mappings: List<ThreadAffinityMapping> = emptyList(),
+    val threadHistory: Map<String, GameThreadHistoryRecord> = emptyMap()
+)
+
 data class GovernorConfig(
     val pollIntervalMs: Long = 150L,
     val adaptivePollingEnabled: Boolean = true,
@@ -326,7 +357,8 @@ data class GovernorConfig(
     // v3.0.0 Afterburn (default OFF); boostPackages = apps/games it is allowed to work on
     val afterburn: AfterburnConfig = AfterburnConfig(),
     val boostPackages: Set<String> = emptySet(),
-    val stutterHunter: StutterHunterConfig = StutterHunterConfig()
+    val stutterHunter: StutterHunterConfig = StutterHunterConfig(),
+    val gameThreadController: GameThreadControllerConfig = GameThreadControllerConfig()
 )
 
 data class PresetItem(

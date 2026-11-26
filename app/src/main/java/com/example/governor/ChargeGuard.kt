@@ -88,6 +88,8 @@ class ChargeGuard(
     private var wakeJob: Job? = null
     @Volatile private var wakeProc: Process? = null
 
+    // v3.7.0: called from the screen receiver and from the engine's stop; one at a time so no job or `getevent` leaks.
+    @Synchronized
     fun onScreenOff() {
         stop()
         val s = ChargeGuardStore.load(ctx)
@@ -95,8 +97,10 @@ class ChargeGuard(
         if (s.fastWake) startWakeListener()
     }
 
+    @Synchronized
     fun onScreenOn() = stop()
 
+    @Synchronized
     fun stop() {
         killJob?.cancel(); killJob = null
         stopWakeListener()

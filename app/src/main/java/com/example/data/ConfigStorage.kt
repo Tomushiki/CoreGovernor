@@ -17,9 +17,12 @@ package com.example.data
 
 import android.content.Context
 import android.net.Uri
+import com.example.governor.GameThreadLogic
 import com.example.model.EfficiencyMode
 import com.example.model.ExplorationRate
 import com.example.model.FreqRange
+import com.example.model.GameThreadControllerConfig
+import com.example.model.GameThreadHistoryRecord
 import com.example.model.GovernorConfig
 import com.example.model.HardwareSpec
 import com.example.model.ModeOverride
@@ -34,6 +37,8 @@ import com.example.model.SmartAppMode
 import com.example.model.StutterHunterConfig
 import com.example.model.StutterHunterMode
 import com.example.model.TempThrottleConfig
+import com.example.model.ThreadAffinityMapping
+import com.example.model.ThreadObservationEntry
 import com.example.model.ThrottleCurveShape
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -548,6 +553,55 @@ class ConfigStorage(private val context: Context) {
                 c.stutterHunter.whitelist.sorted().forEach { wlArr.put(it) }
                 put("whitelist", wlArr)
             })
+            put("gameThreadController", JSONObject().apply {
+                put("enabled", c.gameThreadController.enabled)
+                put("autoClassify", c.gameThreadController.autoClassify)
+                put("selectedGamePackage", c.gameThreadController.selectedGamePackage)
+                if (c.gameThreadController.lastObservedGamePackage.isNotBlank()) {
+                    put("lastObservedGamePackage", c.gameThreadController.lastObservedGamePackage)
+                }
+                val mapArr = JSONArray()
+                val patternMap = JSONObject()
+                c.gameThreadController.mappings.forEach { m ->
+                    val normalizedMask = GameThreadLogic.normalizeStoredHexMask(m.cpuMask) ?: m.cpuMask.trim()
+                    mapArr.put(JSONObject().apply {
+                        put("pattern", m.pattern)
+                        put("cpuMask", normalizedMask)
+                        put("exactMatch", m.exactMatch)
+                        if (m.packageName.isNotBlank()) put("packageName", m.packageName)
+                    })
+                    if (m.pattern.isNotBlank() && normalizedMask.isNotBlank() && !patternMap.has(m.pattern)) {
+                        patternMap.put(m.pattern, normalizedMask)
+                    }
+                }
+                put("mappings", mapArr)
+                put("threadMaskMap", patternMap)
+                val histObj = JSONObject()
+                c.gameThreadController.threadHistory.toSortedMap().forEach { (pkg, record) ->
+                    val cleanPkg = pkg.trim()
+                    if (cleanPkg.isEmpty()) return@forEach
+                    val tArr = JSONArray()
+                    record.threads.forEach { entry ->
+                        val tName = entry.threadName.trim()
+                        if (tName.isNotEmpty()) {
+                            tArr.put(JSONObject().apply {
+                                put("threadName", tName)
+                                put("lastKnownTid", entry.lastKnownTid.coerceAtLeast(0))
+                                put("lastObservedAtMs", entry.lastObservedAtMs.coerceAtLeast(0L))
+                                put("observationCount", entry.observationCount.coerceAtLeast(1))
+                            })
+                        }
+                    }
+                    histObj.put(cleanPkg, JSONObject().apply {
+                        put("packageName", record.packageName.ifBlank { cleanPkg })
+                        if (record.displayName.isNotBlank()) put("displayName", record.displayName)
+                        if (record.lastProcessName.isNotBlank()) put("lastProcessName", record.lastProcessName)
+                        put("lastObservedAtMs", record.lastObservedAtMs.coerceAtLeast(0L))
+                        put("threads", tArr)
+                    })
+                }
+                put("threadHistory", histObj)
+            })
         }
     }
 
@@ -595,6 +649,7 @@ class ConfigStorage(private val context: Context) {
         }
         val ibObj = obj.optJSONObject("afterburn")
         val shObj = obj.optJSONObject("stutterHunter")
+        val gtcObj = obj.optJSONObject("gameThreadController")
         val tObj = obj.optJSONObject("tempThrottle")
         val pObj = obj.optJSONObject("powerThrottle")
 
@@ -712,7 +767,86 @@ class ConfigStorage(private val context: Context) {
                     cpuThresholdPct = shObj.optInt("cpuThresholdPct", 15).coerceIn(10, 40),
                     whitelist = wl
                 )
-            } else default.stutterHunter
+            } else default.stutterHunter,
+            gameThreadController = parseGameThreadControllerConfig(gtcObj)
+        )
+    }
+
+    private fun parseGameThreadControllerConfig(obj: JSONObject?): GameThreadControllerConfig {
+        if (obj == null) return GameThreadControllerConfig()
+        val mappings = mutableListOf<ThreadAffinityMapping>()
+        val mapArr = obj.optJSONArray("mappings")
+        if (mapArr != null) {
+            for (i in 0 until mapArr.length()) {
+                val item = mapArr.optJSONObject(i) ?: continue
+                val pattern = item.optString("pattern", "").trim()
+                val rawMask = item.optString("cpuMask", "")
+                val mask = GameThreadLogic.normalizeStoredHexMask(rawMask) ?: continue
+                if (pattern.isEmpty()) continue
+                mappings.add(
+                    ThreadAffinityMapping(
+                        pattern = pattern,
+                        cpuMask = mask,
+                        exactMatch = item.optBoolean("exactMatch", false),
+                        packageName = item.optString("packageName", "").trim()
+                    )
+                )
+            }
+        } else {
+            val mapObj = obj.optJSONObject("mappings") ?: obj.optJSONObject("threadMaskMap")
+            if (mapObj != null) {
+                mapObj.keys().forEach { key ->
+                    val pattern = key.trim()
+                    val mask = GameThreadLogic.normalizeStoredHexMask(mapObj.optString(key, "")) ?: return@forEach
+                    if (pattern.isNotEmpty()) {
+                        mappings.add(ThreadAffinityMapping(pattern = pattern, cpuMask = mask, exactMatch = false))
+                    }
+                }
+            }
+        }
+        val historyMap = LinkedHashMap<String, GameThreadHistoryRecord>()
+        val histObj = obj.optJSONObject("threadHistory")
+        if (histObj != null) {
+            histObj.keys().forEach { key ->
+                val recObj = histObj.optJSONObject(key) ?: return@forEach
+                val pkg = recObj.optString("packageName", key).trim().ifEmpty { key.trim() }
+                if (pkg.isEmpty()) return@forEach
+                val byName = LinkedHashMap<String, ThreadObservationEntry>()
+                val tArr = recObj.optJSONArray("threads")
+                if (tArr != null) {
+                    for (i in 0 until tArr.length()) {
+                        val tObj = tArr.optJSONObject(i) ?: continue
+                        val tName = tObj.optString("threadName", "").trim()
+                        if (tName.isEmpty()) continue
+                        val obsAt = tObj.optLong("lastObservedAtMs", 0L).coerceAtLeast(0L)
+                        val prev = byName[tName]
+                        val entry = ThreadObservationEntry(
+                            threadName = tName,
+                            lastKnownTid = tObj.optInt("lastKnownTid", 0).coerceAtLeast(0),
+                            lastObservedAtMs = obsAt,
+                            observationCount = tObj.optInt("observationCount", 1).coerceAtLeast(1)
+                        )
+                        if (prev == null || obsAt >= prev.lastObservedAtMs) {
+                            byName[tName] = entry
+                        }
+                    }
+                }
+                historyMap[pkg] = GameThreadHistoryRecord(
+                    packageName = pkg,
+                    displayName = recObj.optString("displayName", "").trim(),
+                    lastProcessName = recObj.optString("lastProcessName", "").trim(),
+                    lastObservedAtMs = recObj.optLong("lastObservedAtMs", 0L).coerceAtLeast(0L),
+                    threads = byName.values.toList()
+                )
+            }
+        }
+        return GameThreadControllerConfig(
+            enabled = obj.optBoolean("enabled", false),
+            autoClassify = obj.optBoolean("autoClassify", false),
+            selectedGamePackage = obj.optString("selectedGamePackage", "").trim(),
+            lastObservedGamePackage = obj.optString("lastObservedGamePackage", "").trim(),
+            mappings = mappings,
+            threadHistory = historyMap
         )
     }
 

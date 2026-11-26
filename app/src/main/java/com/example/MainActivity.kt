@@ -175,6 +175,8 @@ fun CoreGovernorRootScreen(
     val dismissedUpdateVersion by vm.dismissedUpdateVersion.collectAsStateWithLifecycle()
     val protectionStatus by vm.protectionStatus.collectAsStateWithLifecycle()
     val stutterHunterStatus by vm.stutterHunterStatus.collectAsStateWithLifecycle()
+    val gameThreadInspection by vm.gameThreadInspection.collectAsStateWithLifecycle()
+    val isRefreshingGameThreads by vm.isRefreshingGameThreads.collectAsStateWithLifecycle()
     var showUpdatePanel by rememberSaveable { mutableStateOf(false) }
 
     val smartControls by vm.appControls.collectAsStateWithLifecycle()
@@ -598,6 +600,18 @@ fun CoreGovernorRootScreen(
                 installedApps = installedApps,
                 onUpdateStutterHunter = vm::updateStutterHunter,
                 onToggleHunterWhitelist = vm::toggleHunterWhitelist,
+                gameThreadInspection = gameThreadInspection,
+                isRefreshingGameThreads = isRefreshingGameThreads,
+                onRefreshGameThreads = vm::refreshGameThreads,
+                onSetGameThreadEnabled = vm::setGameThreadEnabled,
+                onSetGameThreadAutoClassify = vm::setGameThreadAutoClassify,
+                onSetGameThreadSelectedGame = vm::setGameThreadSelectedGame,
+                onUpsertThreadMappings = vm::upsertThreadMappings,
+                onUpdateThreadMapping = vm::updateThreadMapping,
+                onRemoveThreadMapping = vm::removeThreadMapping,
+                onRemoveHistoricalThread = vm::removeHistoricalThread,
+                onClearGameThreadHistory = vm::clearGameThreadHistory,
+                onClearAllThreadHistory = vm::clearAllThreadHistory,
                 modifier = Modifier
             )
             NavTab.OPPS -> OppTableScreen(

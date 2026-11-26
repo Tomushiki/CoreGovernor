@@ -18,6 +18,7 @@ package com.example.governor
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.media.AudioManager
 import android.os.BatteryManager
@@ -68,6 +69,12 @@ import kotlin.math.roundToInt
 
 private val WHITESPACE_REGEX = Regex("\\s+")
 
+/** How long the Afterburn app stays counted as in front after the foreground package briefly changes. */
+private const val BOOST_FG_GRACE_MS = 3_000L
+
+/** How long a power reading may be reused when a fresh one cannot be read. */
+private const val STALE_POWER_REUSE_MS = 2_500L
+
 /**
  * Single authoritative governor controller for CoreGovernor v2.
  * GPU control operates solely via real OPP indexes written to /proc/gpufreqv2/fix_target_opp_index.
@@ -84,6 +91,22 @@ class GovernorEngine(context: Context) {
     val storage = ConfigStorage(appContext)
     val rootShell = RootShell().apply {
         onLog = { msg -> log(LogLevel.INFO, "RootShell", msg) }
+    }
+
+    /**
+     * v3.7.0 second root shell for slow, occasional jobs (thread scan, process scans, FPS dumpsys), so they
+     * can never queue in front of the control loop's power/frequency reads. Writes stay on [rootShell].
+     */
+    val bgShell = RootShell().apply {
+        onLog = { msg -> log(LogLevel.INFO, "RootShell(bg)", msg) }
+    }
+
+    /**
+     * v3.7.0 third root shell: process scans (Stutter Hunter, System tab) get their own lane so they can
+     * never queue behind the thread scan or the FPS dumpsys on [bgShell]. Read-only; writes stay on [rootShell].
+     */
+    val scanShell = RootShell().apply {
+        onLog = { msg -> log(LogLevel.INFO, "RootShell(scan)", msg) }
     }
     private val discovery = HardwareDiscovery(rootShell)
     private val foregroundDetector = ForegroundDetector(appContext, rootShell)
@@ -169,9 +192,76 @@ class GovernorEngine(context: Context) {
     private val smartRatio = FloatArray(4)
     private var smartWasOn = false
 
+    private val configUpdateLock = Any()
+
+    /** v3.6.7/3.6.8 Game Thread Controller: thread-level taskset CPU affinity in Game mode & thread history. */
+    val gameThreadRuntime = GameThreadRuntime(
+        shellExec = { cmd -> bgShell.exec(cmd) },
+        log = { l, t, m -> log(l, t, m) },
+        onThreadsObserved = { pkg, procName, observedAtMs, threads ->
+            recordObservedGameThreads(pkg, procName, observedAtMs, threads)
+        }
+    )
+
     fun setSmartUiVisible(visible: Boolean) {
         appDemand.uiActive = visible
         refreshCtl.uiActive = visible
+    }
+
+    private fun resolveAppDisplayName(packageName: String): String {
+        val clean = packageName.trim()
+        if (clean.isEmpty()) return ""
+        return try {
+            val pm = appContext.packageManager ?: return ""
+            val appInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getApplicationInfo(clean, PackageManager.ApplicationInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getApplicationInfo(clean, 0)
+            }
+            pm.getApplicationLabel(appInfo)?.toString()?.trim().orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun recordObservedGameThreads(
+        packageName: String,
+        processName: String,
+        observedAtMs: Long,
+        threads: List<LiveThreadInfo>
+    ) {
+        val cleanPkg = packageName.trim()
+        if (cleanPkg.isEmpty() || threads.isEmpty()) return
+        val displayName = resolveAppDisplayName(cleanPkg)
+        val cpuCount = GameThreadLogic.availableCpuCount(_hardwareSpec.value)
+        updateConfig { cfg ->
+            val updatedGtc = GameThreadHistoryLogic.mergeObservation(
+                config = cfg.gameThreadController,
+                packageName = cleanPkg,
+                displayName = displayName,
+                processName = processName,
+                observedThreads = threads,
+                observedAtMs = observedAtMs,
+                availableCpuCount = cpuCount
+            )
+            if (updatedGtc == cfg.gameThreadController) cfg else cfg.copy(gameThreadController = updatedGtc)
+        }
+    }
+
+    suspend fun inspectForegroundGameThreads(nowMs: Long = System.currentTimeMillis()): GameThreadInspectionResult {
+        val rootOk = rootShell.ensureSession()
+        val fgPkg = foregroundDetector.detectForegroundPackage(nowMs)
+        val cfg = _config.value
+        val cpuCount = GameThreadLogic.availableCpuCount(_hardwareSpec.value)
+        return gameThreadRuntime.inspectForegroundGame(
+            nowMs = nowMs,
+            fgPkg = fgPkg,
+            gamePackages = cfg.gamePackages,
+            rootAvailable = rootOk,
+            availableCpuCount = cpuCount,
+            config = cfg.gameThreadController
+        )
     }
 
     private val _hardwareSpec = MutableStateFlow(HardwareSpec())
@@ -254,6 +344,10 @@ class GovernorEngine(context: Context) {
 
     // v3.0.0 Afterburn state
     private var afterburnDecision = AfterburnDecision(0f, AfterburnState.OFF)
+    private var boostSelectedUntilMs = 0L
+    private var smoothedSagMv = 0f
+    private var lastSagSampleMs = 0L
+    private var lastAfterburnWhyMs = 0L
     private val batteryTruthModel = BatteryTruthModel().also {
         it.load(appContext.getSharedPreferences("battery_truth", 0).getString("profile", null))
     }
@@ -262,6 +356,8 @@ class GovernorEngine(context: Context) {
     // Power throttle state
     private val wattWindow = ArrayDeque<Float>()
     private var overPowerSinceMs: Long? = null
+    private var lastPowerStepMs = 0L
+    private var lastPowerOverMs = 0L
     private var currentPowerCapPct = 100f
     private var gpuShareSmoothed = 0.5f
     private val smoothedClusterShare = mutableMapOf<Int, Float>()
@@ -301,6 +397,14 @@ class GovernorEngine(context: Context) {
     private var learnedDischargeSign = 0
     private var dischargeSignScore = 0
     private var smoothedChargeWatts = 0f
+    private var lastGoodPowerReading: PowerReading? = null
+    private var lastGoodPowerAtMs = 0L
+
+    private fun readSysfsDirect(path: String): Long? = try {
+        java.io.File(path).readText().trim().toLongOrNull()
+    } catch (_: Throwable) {
+        null
+    }
     private val displayRefreshHz: Float =
         (appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
             ?.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate?.takeIf { it >= 30f } ?: 60f
@@ -761,6 +865,7 @@ class GovernorEngine(context: Context) {
         smartWasOn = false
         interaction.setActive(false, false)
         refreshCtl.shutdown()
+        gameThreadRuntime.reset()
         metrics.onStopped()
         stopFpsSampler()
         sensorPinner.setServiceRunning(false)
@@ -950,9 +1055,24 @@ class GovernorEngine(context: Context) {
         val burstRemaining = (burstEndTimeMs - nowMs).coerceAtLeast(0L)
 
         // 5. Power & Battery State (with 3s hysteresis)
-        val rawCurrent = hw.batteryPower.currentPath?.let { batch[it]?.toLongOrNull() } ?: 0L
-        val rawVoltage = hw.batteryPower.voltagePath?.let { batch[it]?.toLongOrNull() } ?: 0L
-        val rawReading = if (hw.batteryPower.currentPath != null && hw.batteryPower.voltagePath != null) {
+        // v3.7.0: when the root read lacks the battery nodes, read them directly (no shell, so it cannot
+        // queue behind a busy root shell). Falls back to nothing if the app is not allowed to read them.
+        val rawCurrentOrNull = hw.batteryPower.currentPath?.let { path ->
+            batch[path]?.trim()?.toLongOrNull() ?: readSysfsDirect(path)
+        }
+        val rawVoltageOrNull = hw.batteryPower.voltagePath?.let { path ->
+            batch[path]?.trim()?.toLongOrNull() ?: readSysfsDirect(path)
+        }
+        // A failed/empty read (busy root shell in games) must not count as a 0 W sample: reuse the last good
+        // reading, but only briefly. A frozen value used to stay on screen (and drive the cap) indefinitely.
+        val readMissing = hw.batteryPower.currentPath != null && hw.batteryPower.voltagePath != null &&
+            (rawCurrentOrNull == null || rawVoltageOrNull == null) && lastGoodPowerReading != null &&
+            nowMs - lastGoodPowerAtMs < STALE_POWER_REUSE_MS
+        val rawCurrent = rawCurrentOrNull ?: 0L
+        val rawVoltage = rawVoltageOrNull ?: 0L
+        val rawReading = if (readMissing) {
+            lastGoodPowerReading!!
+        } else if (hw.batteryPower.currentPath != null && hw.batteryPower.voltagePath != null) {
             SysfsParsers.computePowerReading(
                 rawCurrent = rawCurrent,
                 rawVoltage = rawVoltage,
@@ -978,6 +1098,11 @@ class GovernorEngine(context: Context) {
                 currentMa = 0f,
                 voltageMv = cachedBattVoltMv
             )
+        }
+
+        if (!readMissing && rawCurrentOrNull != null && rawVoltageOrNull != null) {
+            lastGoodPowerReading = rawReading
+            lastGoodPowerAtMs = nowMs
         }
 
         // Learn AUTO_ABS sign from clear BatteryManager status vs raw current
@@ -1067,20 +1192,42 @@ class GovernorEngine(context: Context) {
         }
         // Decisions use the voltage-graded level when it is trustworthy, otherwise the gauge.
         // The charge-side grade (v3.6.6) is shown only: the charger inflates voltage, so Afterburn never uses it.
+        // v3.7.0: the voltage-graded level may sit at most 10 points under the gauge, so one sag-distorted
+        // estimate can never push a healthy phone into the low-battery rules or the 5% cutoff.
         val effBattPct = if (batteryTruth.valid && !batteryTruth.charging && batteryTruth.confidencePct >= 50) {
-            batteryTruth.truePct.roundToInt().coerceIn(0, 100)
+            batteryTruth.truePct.roundToInt().coerceIn(0, 100).coerceAtLeast((cachedBatteryPct - 10).coerceAtLeast(0))
         } else cachedBatteryPct
         val prevBoostState = afterburnDecision.state
+        // v3.7.0: a game that briefly shows another package (login page, WebView, overlay, shade) must not drop
+        // the boost: the selected app counts as still in front for a short grace period.
+        if (fgPkg in cfg.boostPackages) boostSelectedUntilMs = nowMs + BOOST_FG_GRACE_MS
+        val boostAppSelected = fgPkg in cfg.boostPackages || nowMs < boostSelectedUntilMs
+        // v3.7.0: one load spike must not trip the voltage-sag cut: judge the sag on a ~2 s average.
+        val sagDt = (nowMs - lastSagSampleMs).coerceIn(0L, 2_000L)
+        lastSagSampleMs = nowMs
+        val sagAlpha = (sagDt / 2_000f).coerceIn(0.05f, 1f)
+        smoothedSagMv += (batteryTruth.sagMv - smoothedSagMv) * sagAlpha
         afterburnDecision = AfterburnLogic.decide(
             cfg = cfg.afterburn,
-            appSelected = fgPkg in cfg.boostPackages,
+            appSelected = boostAppSelected,
             tempC = tempC,
             throttleStartC = cfg.tempThrottle.startTempC,
             batteryPct = effBattPct,
             pluggedOrCharging = stableBatteryState.isPluggedOrCharging,
             wasActive = afterburnDecision.active,
-            sagMv = batteryTruth.sagMv
+            sagMv = smoothedSagMv
         )
+        // v3.7.0: say why it is not boosting (the state log skips IDLE, so a missed foreground match was invisible).
+        if (cfg.afterburn.enabled && fgPkg in cfg.boostPackages && !afterburnDecision.active &&
+            nowMs - lastAfterburnWhyMs >= 10_000L
+        ) {
+            lastAfterburnWhyMs = nowMs
+            log(
+                LogLevel.INFO,
+                "Afterburn",
+                "Afterburn waiting (${afterburnDecision.state.label}): ${"%.1f".format(Locale.US, tempC)}C vs start ${"%.1f".format(Locale.US, cfg.tempThrottle.startTempC)}C (needs ${"%.1f".format(Locale.US, cfg.afterburn.thermalMarginC)}C margin), batt ${effBattPct}% (gauge ${cachedBatteryPct}%), sag ${smoothedSagMv.roundToInt()}mV"
+            )
+        }
         val boostLevel = afterburnDecision.level
         if (afterburnDecision.state != prevBoostState) {
             _afterburnEvents.tryEmit(
@@ -1120,30 +1267,27 @@ class GovernorEngine(context: Context) {
             avgWatts = if (wattWindow.isNotEmpty()) wattWindow.average().toFloat() else rawReading.dischargeWatts
             smoothedChargeWatts = 0f
             if (cfg.powerThrottle.enabled) {
-                if (avgWatts > cfg.powerThrottle.limitWatts && boostLevel > 0f) {
-                    // Afterburn is bypassing the cap: hold the stored cap so it does not sink while boosting.
-                    overPowerSinceMs = null
-                } else if (avgWatts > cfg.powerThrottle.limitWatts) {
-                    val startOver = overPowerSinceMs ?: nowMs.also { overPowerSinceMs = it }
-                    if (nowMs - startOver >= cfg.powerThrottle.sustainMs) {
-                        val prevCap = currentPowerCapPct
-                        currentPowerCapPct = (currentPowerCapPct - cfg.powerThrottle.stepPct)
-                            .coerceIn(cfg.safetyFloorPct, 100f)
-                        if (prevCap >= 99.5f && currentPowerCapPct < 99.5f) {
-                            log(
-                                LogLevel.WARN,
-                                "PowerCap",
-                                "Power draw ${"%.2f".format(avgWatts)}W > ${cfg.powerThrottle.limitWatts}W limit; stepping cap down."
-                            )
-                        }
-                        overPowerSinceMs = nowMs - (cfg.powerThrottle.sustainMs / 2L)
-                    }
-                } else {
-                    overPowerSinceMs = null
-                    if (avgWatts < cfg.powerThrottle.limitWatts * 0.92f && currentPowerCapPct < 100f) {
-                        currentPowerCapPct = (currentPowerCapPct + cfg.powerThrottle.releaseStepPct)
-                            .coerceIn(cfg.safetyFloorPct, 100f)
-                    }
+                val fastWatts = if (wattWindow.isNotEmpty()) wattWindow.toList().takeLast(3).average().toFloat() else avgWatts
+                val prevCap = currentPowerCapPct
+                val st = PowerCapController.step(
+                    prev = PowerCapController.State(currentPowerCapPct, overPowerSinceMs ?: -1L, lastPowerStepMs, lastPowerOverMs),
+                    nowMs = nowMs,
+                    avgWatts = avgWatts,
+                    fastWatts = fastWatts,
+                    cfg = cfg.powerThrottle,
+                    floorPct = cfg.safetyFloorPct,
+                    bypassed = boostLevel > 0f
+                )
+                currentPowerCapPct = st.capPct
+                overPowerSinceMs = st.overSinceMs.takeIf { it >= 0L }
+                lastPowerStepMs = st.lastStepMs
+                lastPowerOverMs = st.lastOverMs
+                if (prevCap >= 99.5f && currentPowerCapPct < 99.5f) {
+                    log(
+                        LogLevel.WARN,
+                        "PowerCap",
+                        "Power draw ${"%.2f".format(avgWatts)}W > ${cfg.powerThrottle.limitWatts}W limit; stepping cap down."
+                    )
                 }
             } else {
                 overPowerSinceMs = null
@@ -1855,6 +1999,18 @@ class GovernorEngine(context: Context) {
         }
         metrics.onTelemetry(_telemetry.value, nowMs)
 
+        // 8b. v3.6.7 Game Thread Controller (runs >= 2s apart, only when enabled, Game mode, configured game foreground)
+        gameThreadRuntime.onControlTick(
+            nowMs = nowMs,
+            config = cfg.gameThreadController,
+            activeMode = activeMode,
+            fgPkg = fgPkg,
+            gamePackages = cfg.gamePackages,
+            rootAvailable = rootShell.isRootAvailable,
+            availableCpuCount = GameThreadLogic.availableCpuCount(hw),
+            isSleepSaving = isSleepSaving
+        )
+
         // 9. v2.7.4 adaptive polling: decide how long the loop may sleep before the next tick.
         val pollBase = cfg.pollIntervalMs.coerceIn(50L, 1000L)
         val pollDecision = PollPolicy.decide(
@@ -1958,7 +2114,7 @@ class GovernorEngine(context: Context) {
                 }
             }
             val path = kernelPath ?: return null
-            val r = rootShell.exec("cat $path 2>/dev/null")
+            val r = bgShell.exec("cat $path 2>/dev/null")
             if (r.stdout.isBlank()) return null
             val trimmedOut = r.stdout.trim()
             val parts = trimmedOut.split(WHITESPACE_REGEX)
@@ -1969,7 +2125,7 @@ class GovernorEngine(context: Context) {
         // Method B (VTools-style): SurfaceFlinger global frame counter (binder transaction 1013)
         suspend fun sampleServiceCall(): Float? {
             if (sfUnsupported) return null
-            val r = rootShell.exec("service call SurfaceFlinger 1013 2>/dev/null")
+            val r = bgShell.exec("service call SurfaceFlinger 1013 2>/dev/null")
             val text = r.stdout
             val idx = text.indexOf("(")
             if (!text.contains("Parcel") || idx < 0 || text.length < idx + 9) {
@@ -1996,10 +2152,10 @@ class GovernorEngine(context: Context) {
         // so the counters of all entries with the same layer name are added together.
         suspend fun sampleTimestats(pkg: String): Float? {
             if (!timestatsEnabled) {
-                rootShell.exec("dumpsys SurfaceFlinger --timestats -enable")
+                bgShell.exec("dumpsys SurfaceFlinger --timestats -enable")
                 timestatsEnabled = true
             }
-            val res = rootShell.exec("dumpsys SurfaceFlinger --timestats -dump | grep -E '^layerName|^totalFrames'")
+            val res = bgShell.exec("dumpsys SurfaceFlinger --timestats -dump | grep -E '^layerName|^totalFrames'")
             if (res.stdout.isBlank()) return null
             val currentLayers = mutableMapOf<String, Long>()
             var currentLayer: String? = null
@@ -2253,10 +2409,15 @@ class GovernorEngine(context: Context) {
     }
 
     fun updateConfig(transform: (GovernorConfig) -> GovernorConfig) {
-        val prev = _config.value
-        val next = transform(prev)
-        _config.value = next
-        storage.saveConfigDebounced(next)
+        val prev: GovernorConfig
+        val next: GovernorConfig
+        synchronized(configUpdateLock) {
+            prev = _config.value
+            next = transform(prev)
+            if (prev == next) return
+            _config.value = next
+            storage.saveConfigDebounced(next)
+        }
         _telemetry.update { it.copy(modeOverride = next.modeOverride) }
 
         if (prev.batteryEstimationEnabled != next.batteryEstimationEnabled ||
@@ -2274,6 +2435,10 @@ class GovernorEngine(context: Context) {
                     if (next.efficiencyLearningEnabled) "Efficiency governor ENABLED (mode=${next.efficiencyMode.name})" else "Efficiency governor DISABLED (standard scaling)"
                 )
             }
+        }
+
+        if (prev.gameThreadController.enabled && !next.gameThreadController.enabled) {
+            gameThreadRuntime.reset()
         }
 
         if (controlJob?.isActive == true) {
@@ -2451,6 +2616,11 @@ class GovernorEngine(context: Context) {
         lastRamReassertMs = 0L
         latchedPeakTempC = 0f
         afterburnDecision = AfterburnDecision(0f, AfterburnState.OFF)
+        boostSelectedUntilMs = 0L
+        smoothedSagMv = 0f
+        lastSagSampleMs = 0L
+        lastPowerStepMs = 0L
+        lastPowerOverMs = 0L
         batteryTruthModel.reset()
         currentTempCpuCapPct = 100f
         currentTempGpuCapPct = 100f
@@ -2463,6 +2633,7 @@ class GovernorEngine(context: Context) {
         smoothedChargeWatts = 0f
         lastSlowBattSysfsReadMs = 0L
         lastBatteryCheckMs = 0L
+        gameThreadRuntime.reset()
     }
 
     private fun installCrashRestoreHook() {

@@ -20,6 +20,7 @@ import android.content.res.Configuration
 import android.os.SystemClock
 import android.view.WindowManager
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
@@ -93,6 +94,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.governor.GameThreadInspectionResult
 import com.example.governor.SensorPinner
 import com.example.model.FreqRange
 import com.example.model.GovernorConfig
@@ -105,6 +107,7 @@ import com.example.model.PowerPolarity
 import com.example.model.PowerUnitScale
 import com.example.model.PresetItem
 import com.example.model.TelemetryState
+import com.example.model.ThreadAffinityMapping
 import com.example.model.ThrottleCurveShape
 import com.example.service.BootState
 import com.example.service.OverlaySizing
@@ -132,6 +135,7 @@ private enum class TuningCategory(@StringRes val labelRes: Int) {
     NIFTY(R.string.tuning_cat_nifty),
     THERMAL(R.string.tuning_cat_thermal),
     POWER(R.string.tuning_cat_power),
+    GAME_THREADS(R.string.tuning_cat_game_threads),
     PRESETS(R.string.tuning_cat_presets)
 }
 
@@ -246,6 +250,18 @@ fun TuningScreen(
         cpuThresholdPct: Int?
     ) -> Unit = { _, _, _, _ -> },
     onToggleHunterWhitelist: (String) -> Unit = {},
+    gameThreadInspection: GameThreadInspectionResult = GameThreadInspectionResult(),
+    isRefreshingGameThreads: Boolean = false,
+    onRefreshGameThreads: () -> Unit = {},
+    onSetGameThreadEnabled: (Boolean) -> Unit = {},
+    onSetGameThreadAutoClassify: (Boolean) -> Unit = {},
+    onSetGameThreadSelectedGame: (String) -> Unit = {},
+    onUpsertThreadMappings: (List<ThreadAffinityMapping>) -> Unit = {},
+    onUpdateThreadMapping: (Int, ThreadAffinityMapping) -> Unit = { _, _ -> },
+    onRemoveThreadMapping: (Int) -> Unit = {},
+    onRemoveHistoricalThread: (String, String) -> Unit = { _, _ -> },
+    onClearGameThreadHistory: (String) -> Unit = {},
+    onClearAllThreadHistory: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -275,6 +291,16 @@ fun TuningScreen(
     var editingMode by rememberSaveable { mutableStateOf(GovernorMode.NORMAL) }
     var presetNameInput by remember { mutableStateOf("") }
     var fineOverlayControl by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(selectedCategory) {
+        if (selectedCategory == TuningCategory.GAME_THREADS) {
+            onRefreshGameThreads()
+        }
+    }
+
+    BackHandler(enabled = selectedCategory != TuningCategory.ALL) {
+        selectedCategory = TuningCategory.ALL
+    }
 
     val editingModeLabel = stringResource(
         if (editingMode == GovernorMode.NORMAL) R.string.mode_normal else R.string.mode_game
@@ -1100,6 +1126,35 @@ fun TuningScreen(
                         onToggleWhitelist = onToggleHunterWhitelist
                     )
                 }
+            }
+
+            // 4b. Game Thread Controller
+            if (selectedCategory == TuningCategory.ALL) {
+                item {
+                    GameThreadSummaryCard(
+                        config = config,
+                        onOpenGameThreads = { selectedCategory = TuningCategory.GAME_THREADS }
+                    )
+                }
+            }
+            if (selectedCategory == TuningCategory.GAME_THREADS) {
+                gameThreadsItems(
+                    config = config,
+                    hardwareSpec = hardwareSpec,
+                    inspection = gameThreadInspection,
+                    isRefreshing = isRefreshingGameThreads,
+                    installedApps = installedApps,
+                    onRefresh = onRefreshGameThreads,
+                    onSetEnabled = onSetGameThreadEnabled,
+                    onSetAutoClassify = onSetGameThreadAutoClassify,
+                    onSetSelectedGame = onSetGameThreadSelectedGame,
+                    onUpsertMappings = onUpsertThreadMappings,
+                    onUpdateMapping = onUpdateThreadMapping,
+                    onRemoveMapping = onRemoveThreadMapping,
+                    onRemoveHistoricalThread = onRemoveHistoricalThread,
+                    onClearGameHistory = onClearGameThreadHistory,
+                    onClearAllHistory = onClearAllThreadHistory
+                )
             }
 
             // 5. Presets, JSON Export/Import & Hardware Details

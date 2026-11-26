@@ -46,6 +46,11 @@ import com.example.CoreGovernorApp
 import com.example.R
 import com.example.data.LocaleHelper
 import com.example.governor.BatteryEstimatorUiSnapshot
+import com.example.governor.GameThreadHistoryLogic
+import com.example.governor.GameThreadInspectionResult
+import com.example.governor.GameThreadLogic
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.example.governor.MetricSample
 import com.example.governor.PowerModelUiSnapshot
 import com.example.governor.SensorPinner
@@ -64,6 +69,7 @@ import com.example.model.ModeOverride
 import com.example.model.PowerPolarity
 import com.example.model.PowerUnitScale
 import com.example.model.PresetItem
+import com.example.model.ThreadAffinityMapping
 import com.example.model.ThrottleCurveShape
 import com.example.model.withOverlayPosPm
 import com.example.model.withOverlayPositionsReset
@@ -123,6 +129,17 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
 
     private val _usageStatsGranted = MutableStateFlow(engine.hasUsageStatsPermission())
     val usageStatsGranted: StateFlow<Boolean> = _usageStatsGranted.asStateFlow()
+
+    private val _gameThreadInspection = MutableStateFlow(
+        GameThreadInspectionResult(
+            availableCpuCount = GameThreadLogic.availableCpuCount(hardwareSpec.value)
+        )
+    )
+    val gameThreadInspection: StateFlow<GameThreadInspectionResult> = _gameThreadInspection.asStateFlow()
+
+    private val _isRefreshingGameThreads = MutableStateFlow(false)
+    val isRefreshingGameThreads: StateFlow<Boolean> = _isRefreshingGameThreads.asStateFlow()
+    private val gameThreadRefreshMutex = Mutex()
 
     private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
@@ -567,6 +584,130 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun refreshGameThreads() {
+        viewModelScope.launch {
+            if (gameThreadRefreshMutex.isLocked) return@launch
+            gameThreadRefreshMutex.withLock {
+                _isRefreshingGameThreads.value = true
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        engine.inspectForegroundGameThreads()
+                    }
+                    _gameThreadInspection.value = result
+                } finally {
+                    _isRefreshingGameThreads.value = false
+                }
+            }
+        }
+    }
+
+    fun setGameThreadEnabled(enabled: Boolean) {
+        engine.updateConfig { cfg ->
+            cfg.copy(gameThreadController = cfg.gameThreadController.copy(enabled = enabled))
+        }
+    }
+
+    fun setGameThreadAutoClassify(enabled: Boolean) {
+        engine.updateConfig { cfg ->
+            cfg.copy(gameThreadController = cfg.gameThreadController.copy(autoClassify = enabled))
+        }
+    }
+
+    fun setGameThreadSelectedGame(packageName: String) {
+        val clean = packageName.trim()
+        engine.updateConfig { cfg ->
+            cfg.copy(gameThreadController = cfg.gameThreadController.copy(selectedGamePackage = clean))
+        }
+        refreshGameThreads()
+    }
+
+    fun removeHistoricalThread(packageName: String, threadName: String) {
+        engine.updateConfig { cfg ->
+            val updated = GameThreadHistoryLogic.removeHistoricalThread(
+                config = cfg.gameThreadController,
+                packageName = packageName,
+                threadName = threadName
+            )
+            if (updated == cfg.gameThreadController) cfg else cfg.copy(gameThreadController = updated)
+        }
+    }
+
+    fun clearGameThreadHistory(packageName: String) {
+        engine.updateConfig { cfg ->
+            val updated = GameThreadHistoryLogic.clearGameHistory(
+                config = cfg.gameThreadController,
+                packageName = packageName
+            )
+            if (updated == cfg.gameThreadController) cfg else cfg.copy(gameThreadController = updated)
+        }
+    }
+
+    fun clearAllThreadHistory() {
+        engine.updateConfig { cfg ->
+            val updated = GameThreadHistoryLogic.clearAllHistory(cfg.gameThreadController)
+            if (updated == cfg.gameThreadController) cfg else cfg.copy(gameThreadController = updated)
+        }
+    }
+
+    fun upsertThreadMappings(newMappings: List<ThreadAffinityMapping>) {
+        if (newMappings.isEmpty()) return
+        val cpuCount = GameThreadLogic.availableCpuCount(hardwareSpec.value)
+        engine.updateConfig { cfg ->
+            val gtc = cfg.gameThreadController
+            val updated = gtc.mappings.toMutableList()
+            for (raw in newMappings) {
+                val pattern = raw.pattern.trim()
+                val mask = GameThreadLogic.sanitizeHexMask(raw.cpuMask, cpuCount) ?: continue
+                if (pattern.isEmpty()) continue
+                val clean = raw.copy(
+                    pattern = pattern,
+                    cpuMask = mask,
+                    packageName = raw.packageName.trim()
+                )
+                val existingIdx = updated.indexOfFirst {
+                    it.pattern == clean.pattern &&
+                        it.exactMatch == clean.exactMatch &&
+                        it.packageName == clean.packageName
+                }
+                if (existingIdx >= 0) {
+                    updated[existingIdx] = clean
+                } else {
+                    updated.add(clean)
+                }
+            }
+            cfg.copy(gameThreadController = gtc.copy(mappings = updated))
+        }
+    }
+
+    fun updateThreadMapping(index: Int, mapping: ThreadAffinityMapping) {
+        val cpuCount = GameThreadLogic.availableCpuCount(hardwareSpec.value)
+        val pattern = mapping.pattern.trim()
+        val mask = GameThreadLogic.sanitizeHexMask(mapping.cpuMask, cpuCount) ?: return
+        if (pattern.isEmpty()) return
+        val clean = mapping.copy(
+            pattern = pattern,
+            cpuMask = mask,
+            packageName = mapping.packageName.trim()
+        )
+        engine.updateConfig { cfg ->
+            val gtc = cfg.gameThreadController
+            if (index !in gtc.mappings.indices) return@updateConfig cfg
+            val updated = gtc.mappings.toMutableList()
+            updated[index] = clean
+            cfg.copy(gameThreadController = gtc.copy(mappings = updated))
+        }
+    }
+
+    fun removeThreadMapping(index: Int) {
+        engine.updateConfig { cfg ->
+            val gtc = cfg.gameThreadController
+            if (index !in gtc.mappings.indices) return@updateConfig cfg
+            val updated = gtc.mappings.toMutableList()
+            updated.removeAt(index)
+            cfg.copy(gameThreadController = gtc.copy(mappings = updated))
+        }
+    }
+
     fun saveNamedPreset(name: String) = engine.saveNamedPreset(name)
     fun loadPreset(preset: PresetItem) = engine.loadPreset(preset)
     fun deletePreset(preset: PresetItem) = engine.deletePreset(preset)
@@ -787,8 +928,8 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
 
     private suspend fun sampleProcesses() {
         try {
-            engine.rootShell.ensureSession()
-            val r = engine.rootShell.exec(ProcessMonitor.COMMAND)
+            engine.scanShell.ensureSession()
+            val r = engine.scanShell.exec(ProcessMonitor.COMMAND)
             val now = System.currentTimeMillis()
             val procs = ProcessMonitor.parse(r.stdout)
             if (procs.isEmpty()) {

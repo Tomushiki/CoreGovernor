@@ -6,6 +6,29 @@ All notable changes to **CoreGovernor** will be documented in this file.
 
 No changes yet.
 
+## [3.6.8] - 2026-11-25
+
+### Added
+- **Persistent per-game thread history (`Tuning > Game Threads`).** Observed live threads are merged and saved per game inside `core_governor_config.json` (`threadHistory` and `lastObservedGamePackage`), recording game package, display name, last process name, thread name (`comm`), last observed timestamp, observation count, and session `lastKnownTid`.
+- **Thread History UI section.** Distinguishes **LIVE** threads (with current TIDs and latest observation time) from **HISTORICAL** threads (with last known TID, last seen time, observation count, and mapped CPU status), allows switching games, using or assigning/editing Exact or Pattern CPU mappings directly from any historical thread name, removing individual historical entries, and clearing history per game or across all games.
+- **Background-game and history fallback handling.** Opening CoreGovernor while a game is running keeps the selected/last-observed game target intact, refreshes live threads if the game process still has an active PID (`BACKGROUND_LIVE`), or displays saved history with `"Game is not currently active or live threads are unavailable. Showing saved thread history."` (`SHOWING_HISTORY`).
+
+### Changed
+- **Live-TID-only `taskset` enforcement.** Custom mappings created from historical threads always key on the thread name or pattern rather than stale TIDs, and runtime `taskset` pinning continues to target only currently live TIDs while the selected game is active in the foreground.
+- **Backward-compatible config persistence.** Existing configuration files without thread history fields load cleanly with empty history, and history pruning prioritizes custom-mapped and most-recently-observed threads.
+- Version 3.6.8 (versionCode 58).
+
+## [3.6.7] - 2026-11-25
+
+### Added
+- **Game Thread Controller (Tuning > Game Threads, off by default).** Inspects the foreground game's PID and live `/proc/[pid]/task/[tid]/comm` threads via `RootShell` (`TID — thread name` with manual Refresh and safe handling if processes or threads exit), and enforces per-thread CPU affinity using `taskset -p` in Game mode.
+- **Core assignment, matching & presets.** Multi-select CPU core chips (`Core 0`–`Core 7`, bounded safely by detected CPU count), Linux hexadecimal affinity mask conversion, readable core-range labels (`0-2`, `3-5`, `6-7`), quick presets (`Big 6-7`, `Mid 3-5`, `Little 0-2`), both Pattern matching and Exact thread-name matching, plus Edit and Remove actions for saved mappings.
+- **Auto-classify threads fallback.** Optional conservative fallback (off by default) that assigns `Main`/`Render` threads to `Big 6-7` and `Worker` threads to `Mid 3-5` only when no custom mappings exist, never overriding user mappings or guessing unknown threads.
+- **Persistence & runtime safety.** Saved inside `core_governor_config.json` (`gameThreadController` with `enabled`, `autoClassify`, `selectedGamePackage`, `mappings`, and `threadMaskMap`), running in `GovernorEngine` at most once every 2 seconds strictly in Game mode for a selected foreground game, caching unchanged `(pid, thread, mask)` state, and ignoring individual `taskset` failures safely.
+
+### Changed
+- Version 3.6.7 (versionCode 57).
+
 ## [3.6.6] - 2026-11-25
 
 ### Fixed
