@@ -814,6 +814,7 @@ fun GameThreadsPanel(
                                     TextButton(
                                         onClick = { onRemoveHistoricalThread(activeHistoryPkg, row.threadName) },
                                         modifier = Modifier.testTag("gtc_history_remove_$idx")
+                                            .testTag("gtc_history_remove_name_${row.threadName}")
                                     ) {
                                         Text(
                                             stringResource(R.string.common_remove),

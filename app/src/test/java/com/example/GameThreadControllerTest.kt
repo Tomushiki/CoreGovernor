@@ -931,9 +931,8 @@ class GameThreadsUiHistoryTest {
         assertFalse(upserted[0].pattern.contains("9002"))
 
         // Remove individual historical entry
-        rule.onNodeWithTag("gtc_history_remove_1").performScrollTo().performClick()
+        rule.onNodeWithTag("gtc_history_remove_name_OldAudioWorker").performScrollTo().performClick()
         rule.waitForIdle()
-        System.err.println("REMOVED_CALLBACK=$removed")
         assertEquals(listOf("com.game.play" to "OldAudioWorker"), removed)
 
         // Clear game history + clear all history confirmation dialogs
