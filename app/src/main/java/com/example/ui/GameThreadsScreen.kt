@@ -473,9 +473,7 @@ fun GameThreadsPanel(
                     } else {
                         MaterialTheme.colorScheme.surfaceVariant
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("gtc_status_message")
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
                         text = statusMessage,
@@ -485,7 +483,9 @@ fun GameThreadsPanel(
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
-                        modifier = Modifier.padding(10.dp)
+                        modifier = Modifier
+                            .padding(10.dp)
+                            .testTag("gtc_status_message")
                     )
                 }
             }

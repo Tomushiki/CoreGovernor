@@ -257,8 +257,9 @@ object OverlaySizing {
         naturalHAt1: Float
     ): Int {
         if (screenW <= 0 || screenH <= 0) return MIN_SCALE_PCT
-        val wFactor = 0.85f
-        val hFactor = 0.50f
+        // Keep compact overlays narrower than expanded and detailed layouts.
+        val wFactor = if (style == OverlayStyle.COMPACT) 0.60f else 0.45f
+        val hFactor = 0.35f
         val allowedW = screenW.toFloat() * wFactor
         val allowedH = screenH.toFloat() * hFactor
         val ratio = minOf(
