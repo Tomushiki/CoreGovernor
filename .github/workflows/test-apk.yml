@@ -25,7 +25,9 @@ jobs:
         with:
           packages: 'platforms;android-36 build-tools;36.0.0'
       - name: Run unit tests
-        run: ./gradlew :app:testDebugUnitTest --no-daemon --max-workers=1 --stacktrace
+        run: >-
+          ./gradlew :app:testDebugUnitTest --no-daemon --max-workers=1 --stacktrace
+          -Drobolectric.dependency.repo.url=https://maven-central.storage-download.googleapis.com/maven2
       - name: Create temporary test keystore
         run: |
           keytool -genkeypair -v \
