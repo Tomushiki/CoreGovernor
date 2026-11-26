@@ -33,6 +33,9 @@ dependencyResolutionManagement {
   repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
   repositories {
     google()
+    // Use Google's read-only Maven Central mirror first to avoid transient
+    // Maven Central 429 responses in CI; retain Maven Central as fallback.
+    maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
     mavenCentral()
   }
 }
