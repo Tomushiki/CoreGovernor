@@ -25,7 +25,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.coregovernor.mt6789"
+    applicationId = "com.aistudio.coregovernor.mt6789.test"
     minSdk = 24
     targetSdk = 36
     versionCode = 60

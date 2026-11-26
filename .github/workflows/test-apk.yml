@@ -1,0 +1,62 @@
+name: Build Test APK
+on:
+  push:
+    tags:
+      - 'test-v*'
+permissions:
+  contents: write
+concurrency:
+  group: test-apk-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --max-workers=1 --stacktrace
+      - name: Create temporary test keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/test-release.keystore" \
+            -storepass android -keypass android \
+            -alias testkey -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=CoreGovernor Test, OU=Test, O=CoreGovernor, L=Test, ST=Test, C=US"
+      - name: Build test release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/test-release.keystore
+          STORE_PASSWORD: android
+          KEY_ALIAS: testkey
+          KEY_PASSWORD: android
+        run: ./gradlew :app:assembleRelease --no-daemon --max-workers=1 --stacktrace
+      - name: Prepare APK
+        run: |
+          mkdir -p "$RUNNER_TEMP/assets"
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/assets/CoreGovernor-3.7.0-test.apk"
+          sha256sum "$RUNNER_TEMP/assets/CoreGovernor-3.7.0-test.apk" > "$RUNNER_TEMP/assets/CoreGovernor-3.7.0-test.apk.sha256"
+      - name: Publish test prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: CoreGovernor 3.7.0 Test APK
+          prerelease: true
+          body: |
+            Side-by-side test build of CoreGovernor 3.7.0.
+
+            Application ID: `com.aistudio.coregovernor.mt6789.test`
+
+            This APK is signed with a temporary test key and is not the production release. It is intended to install alongside the original app.
+          files: |
+            ${{ runner.temp }}/assets/CoreGovernor-3.7.0-test.apk
+            ${{ runner.temp }}/assets/CoreGovernor-3.7.0-test.apk.sha256
