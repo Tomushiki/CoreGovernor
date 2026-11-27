@@ -153,6 +153,17 @@ class AfterburnToastPolicyTest {
     }
 
     @Test
+    fun boostedAppGetsPillWhetherItIsInGamesListOrBoostList() {
+        val games = setOf("com.game.test")
+        val boost = setOf("com.boost.only")
+        assertTrue(AfterburnToastPolicy.isBoostedAppForeground("com.game.test", games, boost, "com.game.test"))
+        assertTrue(AfterburnToastPolicy.isBoostedAppForeground("com.boost.only", games, boost, "com.boost.only"))
+        assertFalse(AfterburnToastPolicy.isBoostedAppForeground("com.boost.only", games, boost, "com.other.app"))
+        assertFalse(AfterburnToastPolicy.isBoostedAppForeground("com.random", games, boost, "com.random"))
+        assertFalse(AfterburnToastPolicy.isBoostedAppForeground("", setOf(""), setOf(""), ""))
+    }
+
+    @Test
     fun noEndingToastWhenDisabledOrWithoutShownStartToast() {
         assertFalse(AfterburnToastPolicy.evaluate(started(), evt(prev = AfterburnState.BOOSTING, next = AfterburnState.REDUCED, enabled = false, tMs = 105_000L)).first)
         // Start toast was never shown for this session (fresh state): no ending toast either.

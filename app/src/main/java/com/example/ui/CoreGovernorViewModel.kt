@@ -51,12 +51,16 @@ import com.example.governor.GameThreadInspectionResult
 import com.example.governor.GameThreadLogic
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import com.example.governor.AutoTuneLogic
 import com.example.governor.MetricSample
 import com.example.governor.PowerModelUiSnapshot
 import com.example.governor.SensorPinner
 import com.example.governor.SessionInfo
 import com.example.governor.UpdateChecker
 import com.example.governor.UpdateState
+import com.example.model.AutoTuneMode
+import com.example.model.AutoTuneParam
+import com.example.model.CompositeScoreWeights
 import com.example.model.EfficiencyMode
 import com.example.model.ExplorationRate
 import com.example.model.FreqRange
@@ -66,12 +70,20 @@ import com.example.model.InstalledAppInfo
 import com.example.model.LogEntry
 import com.example.model.LogLevel
 import com.example.model.ModeOverride
+import com.example.model.PerGameProfile
 import com.example.model.PowerPolarity
 import com.example.model.PowerUnitScale
 import com.example.model.PresetItem
 import com.example.model.ThreadAffinityMapping
 import com.example.model.ThrottleCurveShape
 import com.example.model.withOverlayPosPm
+import com.example.model.withBoostStrengthFor
+import com.example.model.withOverlayBgOpacityFor
+import com.example.model.withOverlayTextScaleFor
+import com.example.model.withOverlayPosPmFor
+import com.example.model.withOverlayPositionResetFor
+import com.example.model.withOverlayScalePctFor
+import com.example.service.OverlayStyle
 import com.example.model.withOverlayPositionsReset
 import com.example.model.withOverlayScalePct
 import com.example.service.GovernorService
@@ -107,6 +119,8 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
     val logs: StateFlow<List<LogEntry>> = engine.logs
     val powerModelSnapshot: StateFlow<PowerModelUiSnapshot> = engine.powerModel.uiSnapshot
     val batterySnapshot: StateFlow<BatteryEstimatorUiSnapshot> = engine.batteryEstimator.snapshot
+    val batteryHistory: StateFlow<List<com.example.governor.BatteryHistoryPoint>> = engine.batteryHistory.history
+    fun clearBatteryHistory() = engine.batteryHistory.clear()
     val stutterHunterStatus: StateFlow<com.example.governor.StutterHunterStatus> =
         com.example.governor.StutterHunterRunner.status
 
@@ -120,6 +134,9 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
 
     private val _selectedSamples = MutableStateFlow<List<MetricSample>>(emptyList())
     val selectedSamples: StateFlow<List<MetricSample>> = _selectedSamples.asStateFlow()
+
+    private val _comparisonSamples = MutableStateFlow<Map<String, List<MetricSample>>>(emptyMap())
+    val comparisonSamples: StateFlow<Map<String, List<MetricSample>>> = _comparisonSamples.asStateFlow()
 
     private val _installedApps = MutableStateFlow<List<InstalledAppInfo>>(emptyList())
     val installedApps: StateFlow<List<InstalledAppInfo>> = _installedApps.asStateFlow()
@@ -314,7 +331,11 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
                                 overlayClickThrough = clickThrough ?: cfg.overlayClickThrough,
                                 overlayGameOnly = gameOnly ?: cfg.overlayGameOnly,
                                 overlayOpacityPct = (opacityPct ?: cfg.overlayOpacityPct).coerceIn(30, 100),
-                                overlayBgOpacityPct = (bgOpacityPct ?: cfg.overlayBgOpacityPct).coerceIn(0, 100)
+                                overlayBgOpacityPct = (bgOpacityPct ?: cfg.overlayBgOpacityPct).coerceIn(0, 100),
+                                // The main slider sets every style; the per-style sliders then fine-tune one.
+                                overlayCompactBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayCompactBgOpacityPct,
+                                overlayExpandedBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayExpandedBgOpacityPct,
+                                overlayDetailedBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayDetailedBgOpacityPct
                             ).withOverlayScalePct(
                                 landscape = isLandscape,
                                 compactPct = compactScalePct,
@@ -340,7 +361,11 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
                 overlayClickThrough = clickThrough ?: cfg.overlayClickThrough,
                 overlayGameOnly = gameOnly ?: cfg.overlayGameOnly,
                 overlayOpacityPct = (opacityPct ?: cfg.overlayOpacityPct).coerceIn(30, 100),
-                overlayBgOpacityPct = (bgOpacityPct ?: cfg.overlayBgOpacityPct).coerceIn(0, 100)
+                overlayBgOpacityPct = (bgOpacityPct ?: cfg.overlayBgOpacityPct).coerceIn(0, 100),
+                                // The main slider sets every style; the per-style sliders then fine-tune one.
+                                overlayCompactBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayCompactBgOpacityPct,
+                                overlayExpandedBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayExpandedBgOpacityPct,
+                                overlayDetailedBgOpacityPct = if (bgOpacityPct != null) -1 else cfg.overlayDetailedBgOpacityPct
             ).withOverlayScalePct(
                 landscape = isLandscape,
                 compactPct = compactScalePct,
@@ -359,6 +384,31 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
                 cfg.withOverlayPosPm(landscape, xPm, yPm)
             }
         }
+    }
+
+    /** Tunes one overlay style (size, position and/or background opacity) without it having to be the active one. */
+    fun updateOverlayStyle(
+        style: OverlayStyle,
+        isLandscape: Boolean,
+        scalePct: Int?,
+        xPm: Int?,
+        yPm: Int?,
+        bgOpacityPct: Int?,
+        reset: Boolean
+    ) {
+        engine.updateConfig { cfg ->
+            var next = cfg
+            if (reset) next = next.withOverlayPositionResetFor(style)
+            if (scalePct != null) next = next.withOverlayScalePctFor(style, isLandscape, scalePct)
+            if (xPm != null || yPm != null) next = next.withOverlayPosPmFor(style, isLandscape, xPm, yPm)
+            if (bgOpacityPct != null) next = next.withOverlayBgOpacityFor(style, bgOpacityPct)
+            next
+        }
+    }
+
+    /** v3.8.0: text size of one overlay style (70..160 %). */
+    fun setOverlayTextScale(style: OverlayStyle, pct: Int) {
+        engine.updateConfig { cfg -> cfg.withOverlayTextScaleFor(style, pct) }
     }
 
     fun updateSensorPin(
@@ -513,6 +563,31 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun setSmoothMinConfidence(pct: Int) {
+        engine.updateConfig { cfg -> cfg.copy(smoothMinConfidencePct = pct.coerceIn(10, 95)) }
+    }
+
+    fun setSmoothSliceMs(ms: Int) {
+        engine.updateConfig { cfg -> cfg.copy(smoothSliceMs = ms.coerceIn(30, 400)) }
+    }
+
+    fun setSmoothFixDrift(enabled: Boolean) {
+        engine.updateConfig { cfg -> cfg.copy(smoothFixDrift = enabled) }
+    }
+
+    fun setSmoothSliceAuto(enabled: Boolean) {
+        // Switching learning on starts from scratch (forgets earlier results); switching it off keeps nothing in use.
+        engine.updateConfig { cfg ->
+            cfg.copy(smoothSliceAuto = enabled, smoothLearnedSlices = if (enabled) "" else cfg.smoothLearnedSlices)
+        }
+    }
+
+    fun setSmoothPowerLimit(enabled: Boolean) {
+        engine.updateConfig { cfg ->
+            cfg.copy(powerThrottle = cfg.powerThrottle.copy(smoothPowerLimit = enabled))
+        }
+    }
+
     fun updateAfterburn(
         enabled: Boolean? = null,
         strength: com.example.model.BoostStrength? = null,
@@ -571,9 +646,17 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
     fun toggleBoostPackage(packageName: String) {
         engine.updateConfig { cfg ->
             val next = cfg.boostPackages.toMutableSet()
-            if (packageName in next) next.remove(packageName) else next.add(packageName)
-            cfg.copy(boostPackages = next)
+            val removing = packageName in next
+            if (removing) next.remove(packageName) else next.add(packageName)
+            val updated = cfg.copy(boostPackages = next)
+            // A removed app also forgets its own strength.
+            if (removing) updated.withBoostStrengthFor(packageName, null) else updated
         }
+    }
+
+    /** Sets one boosted app's Afterburn strength; null makes it follow the main strength again. */
+    fun setBoostStrength(packageName: String, strength: com.example.model.BoostStrength?) {
+        engine.updateConfig { cfg -> cfg.withBoostStrengthFor(packageName, strength) }
     }
 
     fun toggleGamePackage(packageName: String) {
@@ -826,14 +909,93 @@ class CoreGovernorViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun loadComparisonSamples(sessions: List<SessionInfo>) {
+        if (sessions.isEmpty()) {
+            _comparisonSamples.value = emptyMap()
+            return
+        }
+        val names = sessions.map { it.fileName }.toSet()
+        viewModelScope.launch {
+            val current = _comparisonSamples.value
+            val next = HashMap<String, List<MetricSample>>(sessions.size)
+            for (info in sessions) {
+                val cached = current[info.fileName]
+                next[info.fileName] = cached ?: engine.metrics.loadSession(info)
+            }
+            _comparisonSamples.value = next.filterKeys { it in names }
+        }
+    }
+
+    fun toggleSessionKept(info: SessionInfo) {
+        val nextKept = !info.kept
+        if (_selectedSession.value?.fileName == info.fileName) {
+            _selectedSession.value = _selectedSession.value?.copy(kept = nextKept)
+        }
+        viewModelScope.launch { engine.metrics.setSessionKept(info, nextKept) }
+    }
+
     fun deleteSession(info: SessionInfo) {
         if (_selectedSession.value?.fileName == info.fileName) selectSession(null)
         viewModelScope.launch { engine.metrics.deleteSession(info) }
     }
 
-    fun deleteAllSessions() {
-        selectSession(null)
-        viewModelScope.launch { engine.metrics.deleteAllSessions() }
+    fun deleteAllSessions(includeKept: Boolean = false) {
+        if (includeKept || _selectedSession.value?.kept != true) selectSession(null)
+        viewModelScope.launch { engine.metrics.deleteAllSessions(includeKept) }
+    }
+
+    fun updateScoreWeights(weights: CompositeScoreWeights) {
+        engine.updateConfig(markMidSession = false) { it.copy(scoreWeights = weights) }
+    }
+
+    fun setPerGameProfile(pkg: String, profile: PerGameProfile?) {
+        val clean = pkg.trim()
+        if (clean.isEmpty()) return
+        engine.updateConfig { cfg ->
+            val next = cfg.perGameProfiles.toMutableMap()
+            if (profile == null || profile.isEmpty) {
+                next.remove(clean)
+            } else {
+                next[clean] = profile
+            }
+            cfg.copy(perGameProfiles = next)
+        }
+    }
+
+    fun setAutoTuneEnabled(pkg: String, enabled: Boolean) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.setEnabled(it, pkg, enabled) }
+    }
+
+    fun setAutoTuneMode(pkg: String, mode: AutoTuneMode) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.setMode(it, pkg, mode) }
+    }
+
+    fun setAutoTuneMinMinutes(pkg: String, minutes: Int) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.setMinSessionMinutes(it, pkg, minutes) }
+    }
+
+    fun setAutoTunePaused(pkg: String, paused: Boolean) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.setPaused(it, pkg, paused) }
+    }
+
+    fun toggleAutoTuneLock(pkg: String, param: AutoTuneParam) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.toggleLockParam(it, pkg, param) }
+    }
+
+    fun applyAutoTuneSuggestion(pkg: String) {
+        engine.updateConfig { AutoTuneLogic.applySuggestion(it, pkg) }
+    }
+
+    fun resetAutoTuneToBaseline(pkg: String) {
+        engine.updateConfig { AutoTuneLogic.resetToBaseline(it, pkg) }
+    }
+
+    fun revertAutoTuneToUserSettings(pkg: String) {
+        engine.updateConfig { AutoTuneLogic.revertToUserSettings(it, pkg) }
+    }
+
+    fun retuneAutoTune(pkg: String) {
+        engine.updateConfig(markMidSession = false) { AutoTuneLogic.retune(it, pkg) }
     }
 
     fun clearLiveMetrics() = engine.metrics.clearLive()

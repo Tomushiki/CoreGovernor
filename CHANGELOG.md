@@ -6,6 +6,218 @@ All notable changes to **CoreGovernor** will be documented in this file.
 
 No changes yet.
 
+## [4.3.0] - 2026-11-27
+
+### Added
+- **Fast root writer for the smooth limiter's fast switcher.** A small helper starts once as root (`app_process` running `FastWriterMain` from the app's own APK) and keeps `scaling_max_freq`, `scaling_min_freq` and the GPU node open. Each frequency write is now one direct write over a pipe instead of a whole shell command, so a write should drop from tens of milliseconds to about one. No kernel change.
+- The two CPU writes of a flip (max then min, or min then max) go out in one pipe round trip, in the same order as before.
+- `FastWriteCoreTest` unit tests (keeps files open, no stale bytes, recovers when a node is recreated, protocol).
+
+### Changed
+- Only the fast switcher's shell (`RootShell(fast)`) uses the helper. The control loop and every other shell are unchanged.
+- **Safe fallback.** The helper starts in the background; until it reports ready, and whenever it is unavailable, a call fails, or it hangs for 2 s, writes go through the shell exactly as in 4.2.0 (including the chmod repairs). A write the helper cannot do is retried through the shell. After 3 helper failures it stays off for the session. The log shows `Fast writer ready in N ms`, or the reason it was dropped.
+- The helper is stopped when the governor stops, and exits by itself if the app dies. Nodes that cannot be rewound (some proc files) are reopened for every write.
+- The `WriteLat` "fast switcher" figures now measure the helper path, so they show the gain directly.
+- Version 4.3.0 (versionCode 76).
+
+## [4.2.0] - 2026-11-27
+
+### Changed
+- **The Energy screen's battery section is rebuilt to be readable at a glance.** The old wall of numbers is replaced by plain-language cards:
+  - **Hero card:** big battery ring, "On battery / Charging / Full", time left or time to full in words, and two facts with a one-word verdict (power: light/normal/heavy/very heavy, or charging: slow/normal/fast; temperature: cool/normal/warm/hot).
+  - **History graphs** with a 6 hours / 24 hours / 7 days picker: battery level over time (green bands while plugged in, touch and hold to read any moment) and a power graph (bars up = charging, bars down = using).
+  - **Summary and comparison:** battery lost per hour (overall, screen on, screen off), time on battery, average charging speed, warmest temperature, and a sentence comparing with the period before ("Better: you used 12% less battery per hour").
+  - **Battery health card:** a plain word (Excellent / Good / Showing its age / Worn), the percentage, current vs new capacity, and a clear note when the estimate is still learning.
+  - **Charge and use history:** each charge or use session with duration, % change, average power and screen-on share.
+- The previous detailed battery card (capacity, calibration, charge-time-by-power, segments, design override, reset) is kept under **Show technical details**.
+
+### Added
+- **Battery history recorder** (`BatteryHistory.kt`): one point per minute (or when the level/state changes) with level, state, power, temperature, voltage and screen state, kept for 7 days in `battery_history.csv` and saved every 5 minutes and on stop. "Clear battery history" is in the technical details.
+- `BatteryHistoryTest` unit tests (recording rules, pruning, windows, thinning, sessions, drain summary, file format).
+- Version 4.2.0 (versionCode 75). New texts are English only for now.
+
+## [4.1.1] - 2026-11-27
+
+### Changed
+- **The smooth limiter's fast switcher has its own root shell** (`RootShell(fast)` in the log). In the 4.1.0 log every frequency write took 155-223 ms because it waited behind the control loop's reads on the shared shell, which capped switching at about 6 per second and made slices under ~300 ms pointless. Only the fast switcher's writes use the new shell; the control loop's reads and writes stay serialized on the main shell as before.
+- **Safe handover.** The control loop still never writes a cluster (or the GPU) while the fast switcher owns it, and it now also waits for the fast switcher's in-flight write to finish before writing that cluster again (at most one tick), so the two shells can never write the same file at the same time.
+- **Write time is measured per shell.** The `WriteLat` line now shows `fast switcher`, `control CPU` and `control GPU/other` separately, and slow-write warnings from the fast shell say `(fast shell)`. The slice learner's write-time floor (3 x p90) now uses the fast switcher's own writes.
+- Version 4.1.1 (versionCode 74).
+
+## [4.1.0] - 2026-11-27
+
+### Added
+- **"Smooth limit: fix kernel overrides"** (off by default). While the fast switcher owns a CPU cluster, the control loop did not re-assert limits, so a kernel or vendor override stayed until the next frequency flip. With the option on, an override of the fast switcher's last write makes it write the value again. Safety rules: at most one fix per cluster every 400 ms (no write war on the root shell), never while a CPU or GPU temperature cap is active, and only when the control loop's own read is newer than the last write. The log summarises the fixes once a minute as a `CpuDrift` line (count, what the kernel had, what we wanted).
+- `SmoothSlice.shouldFixDrift` (pure) with unit tests.
+
+### Changed
+- Version 4.1.0 (versionCode 73). The default behaviour is unchanged: the option is off, and overrides are still only counted (as in 4.0.9).
+
+## [4.0.9] - 2026-11-27
+
+### Added
+- **Smooth limit slice length.** New setting "Smooth limit: slice length" (30-400 ms, default 50 ms = exactly the behaviour before 4.0.9). It is the shortest time the smooth limiter stays on one of its two frequency steps. The fast switcher runs on its own 20 ms timer, so this (not the 140-450 ms control tick) is what sets how finely the average power is sliced.
+- **Automatic slice learning** (off by default): "Learn the slice length automatically". Only during long steady game sessions (2 minutes of game, power limit engaged, discharging, no launch burst), one CPU cluster at a time. It measures a 45 s baseline, then tries the next shorter slice from the ladder 400 / 300 / 200 / 150 / 100 / 70 / 50 / 40 / 30 ms for 45 s, and keeps going only while it is better (overshoot smaller or FPS steadier) and nothing is worse (overshoot, FPS steadiness, CpuDrift re-asserts, write time, switch-rate backoff). If something gets worse, or there is no clear gain, it goes back to the last good slice and keeps it. If the load changed too much to compare, the stage is measured again (up to 2 times). The slider is the starting point; the results are saved per cluster. Switching learning on again starts from scratch.
+- **Hard safe range.** Never shorter than 30 ms or longer than 400 ms, and never shorter than 3 x the measured p90 write time (rounded up to the ladder). The existing switch-rate guard (phase doubling above 14 switches/s, 30 s backoff above 28/s) still applies on top.
+- **Write time logging.** Every frequency write is timed (including any wait for the root shell). `WriteLat` log line every 30 s: count, average, p50, p90, max for CPU writes and for GPU/other writes. A single write over 150 ms logs a warning (at most every 10 s).
+- **One `SmoothSlice` log line every time a slice changes** (trial start, kept and trying shorter, reverted, settled, interrupted), with the numbers that decided it, e.g. `cpu_3 slice 100 -> 70 ms (trial)` and `cpu_3 slice settled at 100 ms (kept 100ms: 70ms was worse: ...)`.
+- `SmoothSliceLearnerTest` unit tests (ladder and floor, decision function, window statistics, latency tracker, state machine).
+
+### Changed
+- CpuDrift counting now also sees the kernel overriding the fast switcher's last write (the control loop does not re-assert while the fast switcher owns a cluster, so those overrides were invisible before). It is only counted for the learner; behaviour is unchanged and the `CpuDrift` log lines are unchanged.
+- Version 4.0.9 (versionCode 72).
+
+## [4.0.8] - 2026-11-27
+
+### Changed
+- **The Game Thread Controller has its own root shell.** Its thread scan (which can hold a shell for 4-7 s in a busy game) used to share the background shell with the FPS reads, so FPS updated only about every 8 s in games. The scan and its taskset writes now use a fourth shell (`RootShell(thread)` in the log), so FPS reads, Stutter Hunter and Auto-Tune no longer wait behind it. The control loop's shell is untouched.
+- **Backup plan for slow scans.** When a thread scan takes 1.5 s or more, the app tries a one-command scan (a single `grep` over every thread's `comm` file) once. It is switched to only if it finds about the same threads (90-110% of them) and is at least twice as fast; otherwise the normal scan stays. If the one-command scan ever returns nothing, it falls back to the normal scan. The log says which was chosen.
+- Version 4.0.8 (versionCode 71).
+
+### Added
+- `GameThreadFastEnumTest` unit tests for the one-command scan command, its parsing and the trust check.
+
+## [4.0.7] - 2026-11-27
+
+### Changed
+- **Game Thread Controller scans far less often.** Each scan of the game's threads costs several seconds of root shell time, and it used to repeat every 2 s. It now scans every 2 s only for the first 30 s after a game starts (while threads are still appearing), every 4 s while a scan still finds new threads to pin, and every 12 s once things have settled. Pinning itself is unchanged and new threads (for example when a match loads) are still picked up.
+- **Game-set FPS caps no longer count against the tune.** When the game holds a flat ~30 FPS for 2 s or more (lobby, menu, pause) in a session that otherwise runs well above 30, those seconds are left out of average, minimum, 1%/5% low, median, stability and FPS per watt. Auto-Tune therefore no longer rejects a trial with `safety_p5_collapse` because the game went to its lobby. A session that simply runs at 30 FPS all the time is left alone, and a single dip or a wandering 28-32 FPS run still counts as real. Temperature, power and energy still use every second.
+- Saving a session logs when this happened, for example `Game held a flat ~30 FPS cap for 17s (lobby/menu/pause, set by the game, not by CoreGovernor)`.
+- Version 4.0.7 (versionCode 70).
+
+### Added
+- `GameLimitedFpsTest` unit tests for the cap detection and the scan interval.
+
+## [4.0.6] - 2026-11-27
+
+### Added
+- **Smooth limit minimum model confidence slider** (`Tuning` -> `Power throttling`, shown while Smooth power limit is on). Range 10-95%, default 40%, saved with the config as `smoothMinConfidencePct`. It is separate from the Energy tab's confidence setting, so changing one no longer affects the other.
+- Unit tests for the average-confidence rule, the lower-threshold case, faster cap release and noisy-sample protection.
+
+### Changed
+- **Smooth power limit judges the model by its average confidence.** Before, one rarely-visited frequency step below the threshold switched smoothing off for the whole ladder, so in a game every cluster stayed on `plain (low model confidence)`. Now the average over the steps must reach the slider value, and the two steps actually alternated between must reach half of it.
+- The log reason now shows the numbers, for example `low model confidence (avg 33% < 40%)`, so you can set the slider just below the average.
+- **Power model learns faster.** Confidence builds quicker (about 60% after 8 samples instead of 14), frequency steps never visited inherit more confidence from their neighbours (0.7 instead of 0.45), and each sample corrects the model harder while a step is still young.
+- Version 4.0.6 (versionCode 69).
+
+### Fixed
+- **Power cap sank too far and stayed there.** The cap was cut by up to 12% per 350 ms from the last few noisy watt samples but lifted by only 1-2% per step, so it ratcheted down to about 40% and cost FPS while power was close to the limit. Maximum cut per step is now 2.5x instead of 4x, an engaged cap judges the blend of the fast and slow readings, and release speeds up (up to 8x) the further the draw is under the limit.
+
+## [4.0.5] - 2026-11-26 (Optimized edition)
+
+### Changed
+- **Fewer root round trips when pinning CPU clusters.** The max and min frequency writes for a cluster now go to the root shell as one ordered command instead of two. Write order (max then min when raising, min then max when lowering), per-file error handling, failure cooldowns and log lines are unchanged. Any write that does not report success is retried the old way, including the chmod fallbacks.
+- The two writes can no longer be split by the 20 ms fast switcher, which also reduces waiting on the shared root shell.
+- Version 4.0.5 (versionCode 68).
+
+### Added
+- `SysfsBatchWriteTest` unit tests for the batched write command and its result parsing.
+
+## [4.0.0] - 2026-11-26
+
+### Added
+- **Game Session Comparison & Full Details (`Metrics` tab):**
+  - **Settings snapshot per session:** Each recorded session now captures a compact snapshot of the active tuning state at game start (Game-mode CPU/GPU headroom & ramp speeds, CPU/GPU frequency ranges, thermal throttle curve/start/full/reduction/reaction, power throttle limit/sustain/step/smooth limit, Afterburn state & per-package strength, RAM pin, Stutter Hunter mode, Game Thread Controller, Adaptive Refresh Rate, per-game override status, and Auto-Tune trial ID) inside the `#CG1|` CSV header. Legacy sessions without snapshots continue to load with "Settings not recorded".
+  - **Mid-session change tracking:** Modifying tuning settings while a session is recording keeps the start snapshot intact and increments a `MODIFIED` counter on the session.
+  - **Session Full Details screen:** Displays composite score (0–100), percentile FPS (`1% low`, `Median`, `5% low`, `Avg`), frame stability (% within ±10% of average FPS), power/thermal throttle durations, configurable temperature threshold time-above counter (`42/45/48/50 °C`), downsampled charts, and the full start snapshot table.
+  - **Multi-session Comparison (2–4 sessions):** Side-by-side metrics table with direction arrows + colour-coded better/worse deltas relative to baseline A, shared time-axis overlay charts (FPS, power, temperature), settings-differences-only breakdown, plain-language verdicts, fairness warnings (different games, charging included, duration mismatch, short session < 20 samples, mid-session edits, missing snapshot), and plain-text export via `SessionExport.comparisonText`.
+  - **Tweak Impact Ranking & customizable weights:** Aggregates recorded sessions per game to rank the best and worst tweaks with delta score, FPS, p5, watts, temperature, sample counts, and clear Low confidence warnings when fewer than 3 sessions back either value. Composite score weights (`35% p5 FPS, 25% avg FPS, 20% FPS/W, 10% temp, 10% stability` by default) can be tuned and saved.
+  - **Keep protection:** Bookmarking a session marks it as `KEPT`, protecting it from automatic 40-session pruning and accidental "Delete all" unless explicitly checked.
+- **Auto-Tune Per Game (`Apps` tab -> `Auto-tune & game profile`):**
+  - **Per-game override profiles:** `GovernorConfig.perGameProfiles` stores optional per-package overrides (Game-mode headroom/ramps/ranges, power limit, thermal start/full, Afterburn strength) resolved and cached on package/config change with zero per-tick allocations, clamped safely within global thermal and power limits.
+  - **Conservative trial-based Auto-Tune (OFF by default):** Supports `Suggest only` and `Auto-apply` modes, captures an unplugged clean baseline first, tests one bounded parameter step per full game session (settings only change at game launch, never mid-session), discards charging/short/mid-edited/no-FPS sessions, blacklists and immediately reverts on thermal/power/p5-collapse safety triggers, keeps improvements only when beating the configured reward margin (3% default), supports per-parameter locks, `Reset to baseline`, `Revert to my settings`, `Re-tune`, and a trial journal linked directly to Session Details & Comparison.
+
+### Changed
+- Version 4.0.0 (versionCode 67).
+
+## [3.8.3] - 2026-11-26
+
+### Changed
+- **Smooth power limit also runs when the thermal cap is the tighter one.** Before, thermal caps parked on a single step. Now the limiter alternates between the two steps either side of the thermal cap too (also while charging). Thermal runs get no watt-based trim, since the trim is tied to the power limit; the trim is applied only to components where the power cap is the tighter one.
+- **Smooth power limit is no longer labelled "experimental" and is ON by default for fresh installs only.** Existing saved configs keep whatever they have saved (old configs without the field still load as off).
+- Version 3.8.3 (versionCode 66).
+
+## [3.8.2] - 2026-11-26
+
+### Fixed
+- **Live watts on the overlay slowed down in games.** In 3.8.1 the overlay's watts were only refreshed when a full control tick finished. In a game each tick takes much longer (every frequency write goes through the root shell while the game uses the CPU), so the overlay fell back to a slow update. The overlay now has its own power reader: while the overlay is showing, the screen is on and the phone is discharging, it reads the battery current and voltage every 120 ms on its own timer, directly from the system files (no root shell). If the app is not allowed to read them directly, it uses its own small root shell, never the main one that the control loop uses. The control loop no longer overwrites this value while the reader is running.
+  - Unchanged: the averaged watts used by the power limit, the history graphs, the notification and the logs, and the overlay's 150 ms redraw limit.
+  - Limit: the battery gauge itself usually refreshes about once a second on many phones, so very short spikes can still be flattened by the hardware. Other overlay values (CPU and GPU load and clocks, temperature) still update once per control tick.
+
+### Changed
+- Version 3.8.2 (versionCode 65).
+
+## [3.8.1] - 2026-11-26
+
+### Added
+- **Quick Settings tile "Overlay".** Add it from the tile editor (pencil icon in the Quick Settings panel). Each tap goes to the next step: Off, Compact, Expanded, Detailed, then Off again. The tile shows the current style, works even when Click-through is on, and turns the overlay on (and starts the governor if it is not running). If the overlay permission is missing it tries to grant it with root, otherwise it opens the Android permission screen. Tapping the overlay itself still cycles Compact, Expanded, Detailed as before; the tile follows along.
+
+### Changed
+- **Faster live watts on the overlay.** Three things were slowing it down: the overlay redrew at most once per second (now every 150 ms), the value was a 10-sample average (about 1.5 s of lag; the overlay now shows a fast reading that mostly follows the newest samples), and the control loop slowed down when the phone looked calm (it now stays at your poll interval while the overlay is on). The averaged value is unchanged for the power limit, the history graphs, the notification and the logs, so limiter behaviour does not change. Limit: the battery gauge itself usually refreshes about once a second on many phones, so very short spikes can still be flattened by the hardware.
+- Version 3.8.1 (versionCode 64).
+
+## [3.8.0] - 2026-11-26
+
+### Added
+- **Smooth power limit (`Tuning > Power`, experimental, OFF by default).** Instead of parking a CPU cluster or the GPU on one frequency step, the limiter switches between the two steps either side of the target so the *average* power lands on the limit (example: 5 W at 2.5 GHz, 3.5 W at 2.4 GHz, limit 4 W = about 1/3 of the time on 2.5 and 2/3 on 2.4). It uses the power model to pick the two steps and the share of time, reads the cap as a share of the power range, and applies a slow correction from measured watts if the model is off (limited to +/-15%). Phases are at least 50 ms. If frequency writes pass 14 per second it lengthens the phases, and if they stay far above that it pauses for 30 s.
+  - Switching runs on its own 20 ms timer (a "fast switcher"), so it no longer depends on how long a full control tick takes. The control loop only publishes the plan (two steps and the share of time) about once per tick; the fast switcher alternates the steps. While it owns a component, the control loop does not write that component's frequency.
+  - Falls back to the normal cap when: the poll interval is above 500 ms, the control loop is slower than 700 ms per tick (the plan would go stale), the model is not confident enough (uses the existing minimum confidence setting), or the model looks flat or broken. A plan older than 1.5 s is ignored and the normal loop takes over again. Also not used during Afterburn/burst, or when the thermal cap is the tighter one.
+  - Log tag `SmoothLimit`: when it starts or pauses (with the reason), and every 5 s the step pair and duty per component, measured watts, switches per second and trim.
+  - Limits: while it alternates, the efficiency governor does not pick the frequency for that component (it stays between the two planned steps, never above the load-based target); some kernels fight max-frequency writes (the existing drift re-assert still applies); needs testing on a device. The thermal limit is not smoothed yet.
+  - New config field `powerThrottle.smoothPowerLimit` (old configs load with it off). New pure class `SmoothPowerLimiter` with its own tests.
+- **Text size per overlay style (`Tuning > Overlay`).** Compact, Expanded and Detailed each get a Text size slider (70-160%). It scales labels, values, the ring captions and the Detailed rows (including their line height); the figure in the middle of the rings keeps its size. Measuring, the Size slider limit and drawing all use the same multiplier, so the overlay never gets cut off. New config fields `overlayCompactTextScalePct`, `overlayExpandedTextScalePct`, `overlayDetailedTextScalePct` (100 by default, so nothing changes until you move a slider).
+
+### Fixed
+- Unit test `maxScalePct...` was out of date: it expected per-style caps (60%/45% width, 35% height) but the code uses one cap for all styles (85% width, 50% height). The test now matches the code; app behaviour is unchanged.
+
+### Changed
+- Smooth power limit: the "paused" log line now appears once per cause (it used to repeat every tick), says when it resumes, and the loop-speed average reacts faster and ignores idle pauses. The active log line now shows the real time per control tick.
+- New English texts for the two features above; other languages fall back to English until translated.
+
+## [3.7.2] - 2026-11-26
+
+### Added
+- **Afterburn strength per app (`Tuning > Power > Afterburn`).** Every app in the Boost apps list gets its own Default / Light / Medium / Max choice, so a heavy game can use Max and a lighter app Light. Default follows the main Boost strength. The pill and the Afterburn decision use the strength of the app being boosted (also during the 3 s grace period). Removing an app from the Boost list forgets its strength. New config field `boostStrengthByPkg` (old configs load unchanged).
+
+### Changed
+- Version 3.7.2 (versionCode 62).
+
+## [3.7.1] - 2026-11-26
+
+First release of the 3.7 series (3.7.0 was never published; everything is listed here).
+
+### Added
+- **Independent controls for each overlay style (`Tuning > Overlay`).** Compact, Expanded and Detailed each have their own Size, Horizontal and Vertical sliders (separately for portrait and landscape) and their own "Reset position" button. All three are always editable, not only the one currently showing, and the live one is marked "(showing now)". The Fine chip and the - / + stepping work on every slider. New helpers (`overlayScaleFor`, `withOverlayScalePctFor`, `overlayPosPmFor`, `withOverlayPosPmFor`, `withOverlayPositionResetFor`) and a `updateOverlayStyle` ViewModel action back this.
+- **Afterburn status dot on the overlay.** A small dot in the top-right corner of every overlay style shows what Afterburn is doing for the app in front: green = boosting, amber = reduced, red = blocked (heat or battery). Nothing shows while Afterburn is off or idle. It sits inside the padding, so overlay sizes do not change.
+- **Per-style background opacity.** Compact, Expanded and Detailed each have their own Background opacity slider. Moving the main background opacity slider still sets all three; adjust a style afterwards to fine-tune it. Old configs follow the main value (new fields `overlayCompactBgOpacityPct`, `overlayExpandedBgOpacityPct`, `overlayDetailedBgOpacityPct`, -1 = follow main).
+- **Own size for the Detailed overlay.** Detailed no longer shares its size with Expanded. Until you change it, it keeps following the Expanded size (sentinel `-1`), so existing setups look exactly the same. Landscape falls back to the Detailed portrait size, then to Expanded. New config fields: `overlayDetailedScalePct` and `overlayDetailedScalePctL` (old config files load unchanged).
+- **New power-cap controller (`PowerCapController`, pure and unit tested).** Replaces the old fixed-step loop that sawtoothed around the limit:
+  - steps the cap down in proportion to how far the draw is over the limit (1x to 4x the step);
+  - once engaged, keeps stepping every 350 ms instead of waiting for the sustain time again;
+  - judges the draw on a short window while engaged, so it reacts to what the last step did;
+  - skips half the sustain wait for a big spike (more than 35% over the limit);
+  - only releases after the draw has stayed under 95% of the limit for 1.5 s, so it settles instead of bouncing across the limit;
+  - never goes below the safety floor, and holds the stored cap while Afterburn is bypassing it.
+- **Three root shells.** The control loop's power and frequency reads keep the main shell. Slow, occasional jobs (thread scan, FPS dumpsys) use a second background shell, and process scans (Stutter Hunter, System tab) use a third, so none of them can queue in front of the control loop or each other. Writes stay on the main shell.
+- **Slow root command log.** When a root command runs 400 ms or more, or waits 600 ms or more for the shell, the Log tab names the command (at most one line every 5 s).
+- **Afterburn "waiting" reason.** While a boost app is in front but Afterburn is not boosting, the log says why every 10 s (state, temperature against the throttle start and needed margin, battery level against the gauge, smoothed voltage sag).
+- **Memory-pressure handling in Stutter Hunter and the System tab.** The process scan also reads total and available RAM and the kernel's memory-stall figure, so memory pressure can be told apart from CPU hogs. Covered by new unit tests (`MemoryHogTest`).
+
+### Changed
+- **Battery power reads no longer stall or read as 0 W.** If the root read lacks the battery current or voltage nodes, they are read directly (no shell). A failed or empty read is no longer counted as a 0 W sample: the last good reading is reused for at most 2.5 s, so a frozen value can no longer sit on screen and drive the cap.
+- **Afterburn is steadier in games.**
+  - A game that briefly shows another package (login page, WebView, overlay, notification shade) keeps its boost for a 3 s grace period.
+  - The voltage-sag cut is judged on a roughly 2 s average, so one load spike cannot trip it.
+  - The voltage-graded battery level may sit at most 10 points under the gauge, so one sag-distorted estimate cannot push a healthy phone into the low-battery rules or the 5% cutoff.
+- **Faster game thread scan.** Thread names are read with the shell builtin `read` instead of one `cat` and `tr` per thread, so a game with hundreds of threads no longer holds the root shell for seconds on every scan.
+- **Switching overlay style refreshes the numbers at once** (the per-core rows no longer wait up to a second).
+- Version 3.7.1 (versionCode 61).
+
+### Fixed
+- **Afterburn pill for Boost-list apps.** The "Afterburn engaged" pill was shown only for apps in the Games list, while Afterburn itself only looks at the Boost apps list. An app that was only in the Boost list was boosted with no pill, which looked like Afterburn was not engaging. Any app Afterburn boosts (Games list or Boost apps list) now shows the pill.
+- **Charge sleep guard.** `onScreenOff`, `onScreenOn` and `stop` are now serialized, since they are called from the screen receiver and from the engine's stop, so no kill job or `getevent` process can leak. A power-button listener cancelled while its `su` process was still starting is now destroyed instead of lingering until the next key event.
+- **Stutter Hunter.** `onStop()` (main thread) and the hunting loop (background thread) now share one lock for game-session state, baselines and the detector. The throttle cause reported for an FPS dip is read under that lock, so a stop during a tick can no longer report a wrong or empty cause.
+
 ## [3.6.8] - 2026-11-25
 
 ### Added

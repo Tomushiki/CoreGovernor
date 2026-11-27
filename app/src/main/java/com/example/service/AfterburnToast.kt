@@ -78,7 +78,20 @@ object AfterburnToastPolicy {
         val endedToastShown: Boolean = false
     )
 
-    /** Strict gate: a configured game that is also the current foreground package. boostPackages never qualify. */
+    /**
+     * v3.7.1: the pill is shown for any app Afterburn is allowed to boost: the foreground package must be in the
+     * Games list or in the Boost apps list. Afterburn itself only ever looks at the Boost list, so a Boost-only
+     * app used to be boosted without any pill.
+     */
+    fun isBoostedAppForeground(
+        eventPkg: String,
+        gamePackages: Set<String>,
+        boostPackages: Set<String>,
+        foregroundPkg: String
+    ): Boolean = eventPkg.isNotBlank() && eventPkg == foregroundPkg &&
+        (eventPkg in gamePackages || eventPkg in boostPackages)
+
+    /** Strict game-only gate: a configured game that is also the current foreground package (Games list only). */
     fun isSelectedGameForeground(
         eventPkg: String,
         gamePackages: Set<String>,

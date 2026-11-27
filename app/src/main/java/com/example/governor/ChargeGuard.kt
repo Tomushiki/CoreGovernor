@@ -167,6 +167,9 @@ class ChargeGuard(
                 // The screen may already have come on while the process was starting: do not leave it running.
                 if (!isActive) return@launch
                 wakeProc = proc
+                // stop() may have run between the check above and this assignment and seen no process to
+                // destroy; re-check so the blocking read below can never outlive the screen-off period.
+                if (!isActive) return@launch
                 proc.inputStream.bufferedReader().useLines { lines ->
                     for (line in lines) {
                         if (!isActive) break

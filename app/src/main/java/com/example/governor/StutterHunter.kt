@@ -500,6 +500,7 @@ class StutterHunterRunner(
 
                 val nowMs = System.currentTimeMillis()
                 val shouldHunt: Boolean
+                val suppressedCause: GovernorThrottleCause
                 val tracker: StutterLogic.BaselineTracker
                 synchronized(stateLock) {
                     if (fg != activeGamePkg) {
@@ -533,10 +534,12 @@ class StutterHunterRunner(
                         gpuLoadPct = tel.gpu.loadPct,
                         afterburnState = tel.afterburnState
                     )
+                    // Read under the same lock: onStop() resets the detector from the main thread.
+                    suppressedCause = detector.lastSuppressedCause
                 }
 
-                if (!shouldHunt && detector.lastSuppressedCause != GovernorThrottleCause.NONE) {
-                    reportGovernorThrottle(fg, detector.lastSuppressedCause, tel.fps.roundToInt().coerceAtLeast(0), nowMs)
+                if (!shouldHunt && suppressedCause != GovernorThrottleCause.NONE) {
+                    reportGovernorThrottle(fg, suppressedCause, tel.fps.roundToInt().coerceAtLeast(0), nowMs)
                 }
 
                 if (shouldHunt) {
